@@ -1,0 +1,6 @@
+.env
+.playwright-profile/
+seen_slots.json
+__pycache__/
+*.pyc
+.venv/
