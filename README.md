@@ -3,9 +3,9 @@
 Monitors the three Palaiseau `remise de titre` RDV Préfecture guichets and emails
 you when new appointment slots are detected.
 
-This tool does not bypass or solve CAPTCHA/security-code challenges. When the
-security-code page appears, the browser stays visible and the script waits for
-you to solve it manually.
+By default, CAPTCHA/security-code challenges stay fully manual. Optional local
+OCR assistance can suggest or fill a candidate code, but the browser stays
+visible and waits for you to review and continue.
 
 ## Setup
 
@@ -15,6 +15,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 cp .env.example .env
+```
+
+Optional OCR assistance:
+
+```bash
+git submodule update --init --recursive
+pip install -r requirements-ocr.txt
 ```
 
 Edit `.env` and set your Gmail address plus a Gmail App Password:
@@ -48,6 +55,12 @@ Test email rendering without sending:
 python rdv_monitor.py --once --dry-run-email
 ```
 
+Run once with OCR-assisted security-code fill:
+
+```bash
+python rdv_monitor.py --once --captcha-ocr-mode fill
+```
+
 ## How It Works
 
 - Opens a visible Chromium browser with a persistent profile in
@@ -57,14 +70,17 @@ python rdv_monitor.py --once --dry-run-email
   - `2282`
   - `2283`
 - Navigates toward the `creneau` page.
-- If a security code appears, waits for you to solve it in the browser.
+- If a security code appears, optionally screenshots the CAPTCHA image, runs
+  local OCR, and either prints or fills the candidate code.
+- The script does not submit the security-code form; you review and click
+  `Suivant`.
 - Extracts visible appointment labels containing times.
 - Sends one email for newly detected slots.
 - Saves alerted slot IDs in `seen_slots.json` to avoid duplicate emails.
 
 ## Notes
 
-- Keep the browser visible because the security-code step requires manual input.
+- Keep the browser visible because the security-code step requires manual review.
 - The script checks availability only. It does not book, confirm, or cancel an
   appointment.
 - If the prefecture site changes its wording or markup, the slot parser may need

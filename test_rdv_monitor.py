@@ -4,11 +4,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from captcha_ocr import clean_prediction
 from rdv_monitor import (
     Slot,
+    assist_security_code_with_ocr,
     build_email,
     extract_slot_labels_from_text,
     load_seen,
+    parse_args,
     save_seen,
 )
 
@@ -53,6 +56,78 @@ class EmailTests(unittest.TestCase):
         body = message.get_content()
         self.assertIn("Guichet 12", body)
         self.assertIn("Mardi 12 mai 2026 à 09:30", body)
+
+
+class ArgumentTests(unittest.TestCase):
+    def test_captcha_ocr_mode_defaults_to_off(self):
+        args = parse_args(["--once"])
+        self.assertEqual(args.captcha_ocr_mode, "off")
+
+    def test_captcha_ocr_mode_accepts_fill(self):
+        args = parse_args(["--once", "--captcha-ocr-mode", "fill"])
+        self.assertEqual(args.captcha_ocr_mode, "fill")
+
+
+class CaptchaOCRTests(unittest.TestCase):
+    def test_clean_prediction_removes_whitespace(self):
+        self.assertEqual(clean_prediction(" A b 1 2 \n"), "Ab12")
+
+
+class FakeElement:
+    def __init__(self, *, screenshot_bytes: bytes | None = None):
+        self.screenshot_bytes = screenshot_bytes
+        self.filled_value = None
+        self.clicked = False
+
+    async def is_visible(self, timeout=0):
+        return True
+
+    async def screenshot(self, timeout=0):
+        return self.screenshot_bytes or b""
+
+    async def fill(self, value, timeout=0):
+        self.filled_value = value
+
+    async def click(self, timeout=0):
+        self.clicked = True
+
+
+class FakeLocator:
+    def __init__(self, elements):
+        self.elements = elements
+
+    async def count(self):
+        return len(self.elements)
+
+    def nth(self, index):
+        return self.elements[index]
+
+
+class FakePage:
+    def __init__(self):
+        self.image = FakeElement(screenshot_bytes=b"captcha image")
+        self.input = FakeElement()
+        self.submit = FakeElement()
+
+    def locator(self, selector):
+        if selector.startswith("img["):
+            return FakeLocator([self.image])
+        if selector.startswith("input["):
+            return FakeLocator([self.input])
+        if selector.startswith("button"):
+            return FakeLocator([self.submit])
+        return FakeLocator([])
+
+
+class CaptchaBrowserAssistTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fill_mode_screenshots_and_fills_without_submitting(self):
+        page = FakePage()
+
+        with patch("captcha_ocr.predict_captcha_bytes", return_value=" A b 1 2 "):
+            await assist_security_code_with_ocr(page, "fill")
+
+        self.assertEqual(page.input.filled_value, "Ab12")
+        self.assertFalse(page.submit.clicked)
 
 
 if __name__ == "__main__":

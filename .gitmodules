@@ -1,0 +1,3 @@
+[submodule "third_party/OCR-for-Captcha"]
+	path = third_party/OCR-for-Captcha
+	url = https://huggingface.co/spaces/toandev/OCR-for-Captcha

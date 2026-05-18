@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Monitor RDV Prefecture appointment slots and send email alerts.
 
-This script intentionally does not solve or bypass CAPTCHA/security-code
-challenges. When the security-code page appears, it keeps the visible browser
-open and waits for a human to complete it.
+By default, the security-code page is fully manual. Optional OCR modes can
+suggest or fill a candidate code, but the script still keeps the visible browser
+open and waits for a human to review and continue.
 """
 
 from __future__ import annotations
@@ -53,6 +53,36 @@ NO_SLOT_PATTERNS = [
     re.compile(r"aucune\s+plage\s+horaire", re.IGNORECASE),
     re.compile(r"no\s+appointment", re.IGNORECASE),
 ]
+
+CAPTCHA_OCR_MODES = ("off", "suggest", "fill")
+CAPTCHA_IMAGE_SELECTORS = [
+    "img[src*='captcha' i]",
+    "img[alt*='captcha' i]",
+    "img[id*='captcha' i]",
+    "img[class*='captcha' i]",
+    "canvas[id*='captcha' i]",
+    "canvas[class*='captcha' i]",
+]
+CAPTCHA_INPUT_SELECTORS = [
+    "input[name*='captcha' i]",
+    "input[id*='captcha' i]",
+    "input[name*='code' i]",
+    "input[id*='code' i]",
+    "input[autocomplete='one-time-code']",
+    "input[type='text']",
+]
+
+
+def default_captcha_ocr_mode() -> str:
+    mode = os.getenv("CAPTCHA_OCR_MODE", "off").strip().lower()
+    if mode not in CAPTCHA_OCR_MODES:
+        print(
+            f"Warning: invalid CAPTCHA_OCR_MODE={mode!r}; using 'off'.",
+            file=sys.stderr,
+        )
+        return "off"
+    return mode
+
 
 TIME_PATTERN = re.compile(r"\b(?:[01]?\d|2[0-3])[:h][0-5]\d\b")
 DATEISH_PATTERN = re.compile(
@@ -182,6 +212,20 @@ async def click_first_visible(page: Page, selectors_or_names: list[str]) -> bool
     return False
 
 
+async def first_visible_locator(page: Page, selectors: list[str]) -> Any | None:
+    for selector in selectors:
+        locator = page.locator(selector)
+        count = await locator.count()
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if await candidate.is_visible(timeout=500):
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
 async def accept_cgu_if_present(page: Page) -> bool:
     checked_any = False
     checkboxes = page.locator("input[type='checkbox']")
@@ -207,10 +251,62 @@ async def accept_cgu_if_present(page: Page) -> bool:
     return False
 
 
+async def assist_security_code_with_ocr(page: Page, mode: str) -> None:
+    if mode == "off":
+        return
+
+    try:
+        captcha_image = await first_visible_locator(page, CAPTCHA_IMAGE_SELECTORS)
+        if captcha_image is None:
+            print(
+                "Warning: CAPTCHA OCR requested, but no CAPTCHA image was found.",
+                file=sys.stderr,
+            )
+            return
+
+        image_bytes = await captcha_image.screenshot(timeout=5_000)
+
+        from captcha_ocr import clean_prediction, predict_captcha_bytes
+
+        prediction = clean_prediction(predict_captcha_bytes(image_bytes))
+    except Exception as exc:
+        print(f"Warning: CAPTCHA OCR failed: {exc}", file=sys.stderr)
+        return
+
+    if not prediction:
+        print("Warning: CAPTCHA OCR returned an empty prediction.", file=sys.stderr)
+        return
+
+    print(f"OCR prediction for security code: {prediction}")
+    if mode == "suggest":
+        print("Please enter or review it in the browser and click Suivant.")
+        return
+
+    input_field = await first_visible_locator(page, CAPTCHA_INPUT_SELECTORS)
+    if input_field is None:
+        print(
+            "Warning: CAPTCHA OCR could not find a security-code input field.",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        await input_field.fill(prediction, timeout=2_000)
+    except Exception as exc:
+        print(
+            f"Warning: CAPTCHA OCR could not fill the security-code field: {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    print("Filled the security-code field with the OCR prediction.")
+    print("Please review it in the browser and click Suivant.")
+
+
 async def wait_for_manual_security_code(page: Page, timeout_seconds: int) -> None:
     print("")
     print("Security code detected.")
-    print("Please solve it in the visible browser and click Suivant.")
+    print("Please review or solve it in the visible browser and click Suivant.")
     print(f"The script will wait up to {timeout_seconds // 60} minutes.")
 
     deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -224,7 +320,12 @@ async def wait_for_manual_security_code(page: Page, timeout_seconds: int) -> Non
     raise TimeoutError("Timed out waiting for manual security-code completion.")
 
 
-async def navigate_to_slots(page: Page, demarche: dict[str, str], manual_timeout: int) -> None:
+async def navigate_to_slots(
+    page: Page,
+    demarche: dict[str, str],
+    manual_timeout: int,
+    captcha_ocr_mode: str,
+) -> None:
     did = demarche["id"]
     await page.goto(demarche_url(did), wait_until="networkidle")
 
@@ -233,6 +334,7 @@ async def navigate_to_slots(page: Page, demarche: dict[str, str], manual_timeout
             return
 
         if await has_security_code_challenge(page):
+            await assist_security_code_with_ocr(page, captcha_ocr_mode)
             await wait_for_manual_security_code(page, manual_timeout)
             if "/creneau" in page.url:
                 return
@@ -309,11 +411,12 @@ async def check_demarche(
     context: BrowserContext,
     demarche: dict[str, str],
     manual_timeout: int,
+    captcha_ocr_mode: str,
 ) -> list[Slot]:
     page = await context.new_page()
     try:
         print(f"Checking {demarche['name']} ({demarche['id']})...")
-        await navigate_to_slots(page, demarche, manual_timeout)
+        await navigate_to_slots(page, demarche, manual_timeout, captcha_ocr_mode)
         slots = await extract_slots_from_page(page, demarche)
         print(f"Found {len(slots)} slot candidate(s) for {demarche['id']}.")
         return slots
@@ -389,7 +492,14 @@ async def run_once(args: argparse.Namespace) -> list[Slot]:
             all_slots: list[Slot] = []
             for demarche in DEMARCHES:
                 try:
-                    all_slots.extend(await check_demarche(context, demarche, args.manual_timeout))
+                    all_slots.extend(
+                        await check_demarche(
+                            context,
+                            demarche,
+                            args.manual_timeout,
+                            args.captcha_ocr_mode,
+                        )
+                    )
                 except Exception as exc:
                     print(f"Error while checking {demarche['id']}: {exc}", file=sys.stderr)
             return all_slots
@@ -455,6 +565,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--dry-run-email",
         action="store_true",
         help="Print the alert email instead of sending it.",
+    )
+    parser.add_argument(
+        "--captcha-ocr-mode",
+        choices=CAPTCHA_OCR_MODES,
+        default=default_captcha_ocr_mode(),
+        help=(
+            "OCR assistance for security-code pages: off, suggest, or fill. "
+            "Default: off."
+        ),
     )
     return parser.parse_args(argv)
 

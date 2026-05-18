@@ -1,0 +1,6 @@
+torch
+torchvision
+onnx
+onnxruntime
+Pillow
+huggingface_hub
