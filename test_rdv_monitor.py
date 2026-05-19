@@ -11,6 +11,7 @@ from rdv_monitor import (
     build_email,
     extract_slot_labels_from_text,
     load_seen,
+    page_says_blocked,
     parse_args,
     save_seen,
 )
@@ -60,12 +61,32 @@ class EmailTests(unittest.TestCase):
 
 class ArgumentTests(unittest.TestCase):
     def test_captcha_ocr_mode_defaults_to_off(self):
-        args = parse_args(["--once"])
+        with patch.dict(os.environ, {}, clear=True):
+            args = parse_args(["--once"])
         self.assertEqual(args.captcha_ocr_mode, "off")
 
     def test_captcha_ocr_mode_accepts_fill(self):
-        args = parse_args(["--once", "--captcha-ocr-mode", "fill"])
+        with patch.dict(os.environ, {}, clear=True):
+            args = parse_args(["--once", "--captcha-ocr-mode", "fill"])
         self.assertEqual(args.captcha_ocr_mode, "fill")
+
+    def test_safety_delays_have_conservative_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            args = parse_args(["--once"])
+        self.assertEqual(args.demarche_delay_seconds, 30)
+        self.assertEqual(args.block_backoff_minutes, 120)
+
+
+class BlockDetectionTests(unittest.TestCase):
+    def test_detects_common_block_messages(self):
+        self.assertTrue(page_says_blocked("Accès refusé"))
+        self.assertTrue(page_says_blocked("Too many requests"))
+        self.assertTrue(page_says_blocked("activité suspecte détectée"))
+
+    def test_does_not_treat_no_slot_message_as_block(self):
+        self.assertFalse(
+            page_says_blocked("Il n'existe plus de plage horaire libre.")
+        )
 
 
 class CaptchaOCRTests(unittest.TestCase):

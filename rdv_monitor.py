@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import re
 import smtplib
 import sys
@@ -52,6 +53,20 @@ NO_SLOT_PATTERNS = [
     re.compile(r"plus\s+de\s+plage\s+horaire\s+libre", re.IGNORECASE),
     re.compile(r"aucune\s+plage\s+horaire", re.IGNORECASE),
     re.compile(r"no\s+appointment", re.IGNORECASE),
+]
+
+BLOCK_PATTERNS = [
+    re.compile(r"\b(?:403|429)\b"),
+    re.compile(r"acc[eè]s\s+refus[ée]", re.IGNORECASE),
+    re.compile(r"access\s+denied", re.IGNORECASE),
+    re.compile(r"too\s+many\s+requests", re.IGNORECASE),
+    re.compile(r"trop\s+de\s+(?:requ[êe]tes|demandes|tentatives)", re.IGNORECASE),
+    re.compile(r"nombre\s+maximum\s+de\s+rendez-vous", re.IGNORECASE),
+    re.compile(r"vous\s+avez\s+d[ée]pass[ée]\s+le\s+nombre\s+maximum", re.IGNORECASE),
+    re.compile(r"comportement\s+inhabituel", re.IGNORECASE),
+    re.compile(r"activit[ée]\s+suspecte", re.IGNORECASE),
+    re.compile(r"robot|automate", re.IGNORECASE),
+    re.compile(r"bloqu[ée]", re.IGNORECASE),
 ]
 
 CAPTCHA_OCR_MODES = ("off", "suggest", "fill")
@@ -106,6 +121,10 @@ class Slot:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+class SiteBlockedError(RuntimeError):
+    """Raised when the appointment site appears to block the current session."""
+
+
 def demarche_url(demarche_id: str) -> str:
     return f"{BASE_URL}/rdvpref/reservation/demarche/{demarche_id}/"
 
@@ -138,6 +157,17 @@ def save_seen(path: Path, seen: Iterable[str]) -> None:
 
 def page_says_no_slots(text: str) -> bool:
     return any(pattern.search(text) for pattern in NO_SLOT_PATTERNS)
+
+
+def page_says_blocked(text: str, url: str = "") -> bool:
+    haystack = f"{url}\n{text}"
+    return any(pattern.search(haystack) for pattern in BLOCK_PATTERNS)
+
+
+def jittered_seconds(base_seconds: int, jitter_ratio: float = 0.2) -> int:
+    if base_seconds <= 0:
+        return 0
+    return base_seconds + int(base_seconds * random.uniform(0, jitter_ratio))
 
 
 def normalize_slot_label(label: str) -> str:
@@ -190,6 +220,18 @@ async def safe_inner_text(page: Page) -> str:
         return await page.locator("body").inner_text(timeout=5_000)
     except Exception:
         return ""
+
+
+async def raise_if_site_blocked(page: Page, context: str = "") -> None:
+    text = await safe_inner_text(page)
+    if not page_says_blocked(text, getattr(page, "url", "")):
+        return
+
+    where = f" during {context}" if context else ""
+    raise SiteBlockedError(
+        f"RDV Prefecture appears to be blocking this session{where}. "
+        "Stopping checks and backing off."
+    )
 
 
 async def click_first_visible(page: Page, selectors_or_names: list[str]) -> bool:
@@ -328,8 +370,10 @@ async def navigate_to_slots(
 ) -> None:
     did = demarche["id"]
     await page.goto(demarche_url(did), wait_until="networkidle")
+    await raise_if_site_blocked(page, f"opening demarche {did}")
 
     for _ in range(8):
+        await raise_if_site_blocked(page, f"checking demarche {did}")
         if "/creneau" in page.url:
             return
 
@@ -367,12 +411,17 @@ async def navigate_to_slots(
 
         # If the session is already valid, the direct creneau URL may work.
         await page.goto(creneau_url(did), wait_until="networkidle")
+        await raise_if_site_blocked(page, f"opening creneau page for {did}")
 
     raise RuntimeError(f"Could not reach the creneau page for demarche {did}.")
 
 
 async def extract_slots_from_page(page: Page, demarche: dict[str, str]) -> list[Slot]:
     text = await safe_inner_text(page)
+    if page_says_blocked(text, getattr(page, "url", "")):
+        raise SiteBlockedError(
+            f"RDV Prefecture appears to be blocking this session while reading {demarche['id']}."
+        )
     if page_says_no_slots(text):
         return []
 
@@ -500,6 +549,14 @@ async def run_once(args: argparse.Namespace) -> list[Slot]:
                             args.captcha_ocr_mode,
                         )
                     )
+                    if args.demarche_delay_seconds > 0 and demarche != DEMARCHES[-1]:
+                        print(
+                            "Waiting "
+                            f"{args.demarche_delay_seconds} second(s) before the next démarche."
+                        )
+                        await asyncio.sleep(args.demarche_delay_seconds)
+                except SiteBlockedError:
+                    raise
                 except Exception as exc:
                     print(f"Error while checking {demarche['id']}: {exc}", file=sys.stderr)
             return all_slots
@@ -512,7 +569,21 @@ async def monitor(args: argparse.Namespace) -> None:
     seen = load_seen(seen_path)
 
     while True:
-        slots = await run_once(args)
+        try:
+            slots = await run_once(args)
+        except SiteBlockedError as exc:
+            print(f"Blocked by site: {exc}", file=sys.stderr)
+            if args.once:
+                return
+
+            sleep_seconds = jittered_seconds(args.block_backoff_minutes * 60)
+            print(
+                "Backing off for "
+                f"{sleep_seconds // 60} minute(s) before trying again."
+            )
+            await asyncio.sleep(sleep_seconds)
+            continue
+
         new_slots = [slot for slot in slots if slot.key not in seen]
 
         if new_slots:
@@ -560,6 +631,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=int(os.getenv("MANUAL_CAPTCHA_TIMEOUT_SECONDS", "900")),
         help="Seconds to wait for manual security-code completion. Default: 900.",
+    )
+    parser.add_argument(
+        "--demarche-delay-seconds",
+        type=int,
+        default=int(os.getenv("DEMARCHE_DELAY_SECONDS", "30")),
+        help="Seconds to wait between démarches. Default: 30.",
+    )
+    parser.add_argument(
+        "--block-backoff-minutes",
+        type=int,
+        default=int(os.getenv("BLOCK_BACKOFF_MINUTES", "120")),
+        help="Minutes to wait after a block/error page is detected. Default: 120.",
     )
     parser.add_argument(
         "--dry-run-email",

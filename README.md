@@ -70,10 +70,13 @@ python rdv_monitor.py --once --captcha-ocr-mode fill
   - `2282`
   - `2283`
 - Navigates toward the `creneau` page.
+- Waits 30 seconds between Palaiseau démarches by default.
 - If a security code appears, optionally screenshots the CAPTCHA image, runs
   local OCR, and either prints or fills the candidate code.
 - The script does not submit the security-code form; you review and click
   `Suivant`.
+- If a block/error page is detected, stops the current check and backs off for
+  about 120 minutes before retrying in continuous mode.
 - Extracts visible appointment labels containing times.
 - Sends one email for newly detected slots.
 - Saves alerted slot IDs in `seen_slots.json` to avoid duplicate emails.
