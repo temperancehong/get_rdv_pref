@@ -61,6 +61,12 @@ Run once with OCR-assisted security-code fill:
 python rdv_monitor.py --once --captcha-ocr-mode fill
 ```
 
+Run once with manual CAPTCHA plus Telegram alert:
+
+```bash
+python rdv_monitor.py --once --captcha-ocr-mode off --telegram-captcha-alert
+```
+
 ## How It Works
 
 - Opens a visible Chromium browser with a persistent profile in
@@ -73,6 +79,8 @@ python rdv_monitor.py --once --captcha-ocr-mode fill
 - Waits 30 seconds between Palaiseau démarches by default.
 - If a security code appears, optionally screenshots the CAPTCHA image, runs
   local OCR, and either prints or fills the candidate code.
+- If Telegram alerts are enabled, sends a message asking you to type the
+  security code in the visible browser.
 - The script does not submit the security-code form; you review and click
   `Suivant`.
 - If a block/error page is detected, stops the current check and backs off for

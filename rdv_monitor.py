@@ -17,6 +17,8 @@ import random
 import re
 import smtplib
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
@@ -97,6 +99,13 @@ def default_captcha_ocr_mode() -> str:
         )
         return "off"
     return mode
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 TIME_PATTERN = re.compile(r"\b(?:[01]?\d|2[0-3])[:h][0-5]\d\b")
@@ -345,6 +354,72 @@ async def assist_security_code_with_ocr(page: Page, mode: str) -> None:
     print("Please review it in the browser and click Suivant.")
 
 
+def build_captcha_alert_message(demarche: dict[str, str], page_url: str) -> str:
+    return "\n".join(
+        [
+            "RDV Prefecture security code needed.",
+            "",
+            f"Démarche: {demarche['name']} ({demarche['id']})",
+            f"Page: {page_url}",
+            "",
+            "Please type the code in the visible browser and click Suivant.",
+        ]
+    )
+
+
+def send_telegram_message(token: str, chat_id: str, text: str) -> None:
+    payload = json.dumps(
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Telegram alert failed: {exc.reason}") from exc
+
+    if not body.get("ok"):
+        description = body.get("description", "unknown Telegram API error")
+        raise RuntimeError(f"Telegram alert failed: {description}")
+
+
+async def notify_security_code_with_telegram(
+    page: Page,
+    demarche: dict[str, str],
+    token: str | None,
+    chat_id: str | None,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    if not token or not chat_id:
+        print(
+            "Warning: Telegram CAPTCHA alert enabled, but TELEGRAM_BOT_TOKEN "
+            "or TELEGRAM_CHAT_ID is missing.",
+            file=sys.stderr,
+        )
+        return
+
+    message = build_captcha_alert_message(demarche, getattr(page, "url", ""))
+    try:
+        await asyncio.to_thread(send_telegram_message, token, chat_id, message)
+    except Exception as exc:
+        print(f"Warning: {exc}", file=sys.stderr)
+        return
+
+    print("Sent Telegram security-code alert.")
+
+
 async def wait_for_manual_security_code(page: Page, timeout_seconds: int) -> None:
     print("")
     print("Security code detected.")
@@ -367,6 +442,9 @@ async def navigate_to_slots(
     demarche: dict[str, str],
     manual_timeout: int,
     captcha_ocr_mode: str,
+    telegram_bot_token: str | None,
+    telegram_chat_id: str | None,
+    telegram_captcha_alert: bool,
 ) -> None:
     did = demarche["id"]
     await page.goto(demarche_url(did), wait_until="networkidle")
@@ -378,6 +456,13 @@ async def navigate_to_slots(
             return
 
         if await has_security_code_challenge(page):
+            await notify_security_code_with_telegram(
+                page,
+                demarche,
+                telegram_bot_token,
+                telegram_chat_id,
+                telegram_captcha_alert,
+            )
             await assist_security_code_with_ocr(page, captcha_ocr_mode)
             await wait_for_manual_security_code(page, manual_timeout)
             if "/creneau" in page.url:
@@ -461,11 +546,22 @@ async def check_demarche(
     demarche: dict[str, str],
     manual_timeout: int,
     captcha_ocr_mode: str,
+    telegram_bot_token: str | None,
+    telegram_chat_id: str | None,
+    telegram_captcha_alert: bool,
 ) -> list[Slot]:
     page = await context.new_page()
     try:
         print(f"Checking {demarche['name']} ({demarche['id']})...")
-        await navigate_to_slots(page, demarche, manual_timeout, captcha_ocr_mode)
+        await navigate_to_slots(
+            page,
+            demarche,
+            manual_timeout,
+            captcha_ocr_mode,
+            telegram_bot_token,
+            telegram_chat_id,
+            telegram_captcha_alert,
+        )
         slots = await extract_slots_from_page(page, demarche)
         print(f"Found {len(slots)} slot candidate(s) for {demarche['id']}.")
         return slots
@@ -547,6 +643,9 @@ async def run_once(args: argparse.Namespace) -> list[Slot]:
                             demarche,
                             args.manual_timeout,
                             args.captcha_ocr_mode,
+                            args.telegram_bot_token,
+                            args.telegram_chat_id,
+                            args.telegram_captcha_alert,
                         )
                     )
                     if args.demarche_delay_seconds > 0 and demarche != DEMARCHES[-1]:
@@ -648,6 +747,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--dry-run-email",
         action="store_true",
         help="Print the alert email instead of sending it.",
+    )
+    parser.add_argument(
+        "--telegram-captcha-alert",
+        action="store_true",
+        default=env_flag("TELEGRAM_CAPTCHA_ALERT"),
+        help="Send a Telegram message when a security-code page appears.",
+    )
+    parser.add_argument(
+        "--telegram-bot-token",
+        default=os.getenv("TELEGRAM_BOT_TOKEN"),
+        help="Telegram bot token for security-code alerts.",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        default=os.getenv("TELEGRAM_CHAT_ID"),
+        help="Telegram chat ID for security-code alerts.",
     )
     parser.add_argument(
         "--captcha-ocr-mode",

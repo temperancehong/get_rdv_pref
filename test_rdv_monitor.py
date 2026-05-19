@@ -8,7 +8,9 @@ from captcha_ocr import clean_prediction
 from rdv_monitor import (
     Slot,
     assist_security_code_with_ocr,
+    build_captcha_alert_message,
     build_email,
+    env_flag,
     extract_slot_labels_from_text,
     load_seen,
     page_says_blocked,
@@ -76,6 +78,26 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(args.demarche_delay_seconds, 30)
         self.assertEqual(args.block_backoff_minutes, 120)
 
+    def test_telegram_captcha_alert_defaults_to_off(self):
+        with patch.dict(os.environ, {}, clear=True):
+            args = parse_args(["--once"])
+        self.assertFalse(args.telegram_captcha_alert)
+
+    def test_telegram_captcha_alert_can_read_env(self):
+        with patch.dict(os.environ, {"TELEGRAM_CAPTCHA_ALERT": "true"}, clear=True):
+            args = parse_args(["--once"])
+        self.assertTrue(args.telegram_captcha_alert)
+
+
+class EnvFlagTests(unittest.TestCase):
+    def test_env_flag_handles_common_truthy_values(self):
+        with patch.dict(os.environ, {"EXAMPLE_FLAG": "yes"}, clear=True):
+            self.assertTrue(env_flag("EXAMPLE_FLAG"))
+
+    def test_env_flag_handles_missing_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(env_flag("EXAMPLE_FLAG"))
+
 
 class BlockDetectionTests(unittest.TestCase):
     def test_detects_common_block_messages(self):
@@ -92,6 +114,21 @@ class BlockDetectionTests(unittest.TestCase):
 class CaptchaOCRTests(unittest.TestCase):
     def test_clean_prediction_removes_whitespace(self):
         self.assertEqual(clean_prediction(" A b 1 2 \n"), "Ab12")
+
+
+class TelegramAlertTests(unittest.TestCase):
+    def test_captcha_alert_message_contains_demarche_and_url(self):
+        message = build_captcha_alert_message(
+            {
+                "id": "2282",
+                "name": "Remise de titre - Palaiseau - Guichet 13",
+            },
+            "https://example.test/captcha",
+        )
+
+        self.assertIn("Guichet 13", message)
+        self.assertIn("2282", message)
+        self.assertIn("https://example.test/captcha", message)
 
 
 class FakeElement:
